@@ -1,7 +1,45 @@
 const mineflayer = require('mineflayer');
 const mc = require('minecraft-protocol');
 const http = require('http');
-const config = require('./config.json');
+const localConfig = require('./config.json');
+
+const config = {
+    server: {
+        host: process.env.SERVER_HOST || localConfig.server?.host || "raven-mc.net",
+        port: parseInt(process.env.SERVER_PORT || localConfig.server?.port || 25565, 10)
+    },
+    bot: {
+        name: process.env.BOT_NAME || localConfig.bot?.name || "atomic",
+        auth: process.env.BOT_AUTH || localConfig.bot?.auth || "offline",
+        version: process.env.BOT_VERSION === 'false' ? false : (process.env.BOT_VERSION || localConfig.bot?.version || false)
+    },
+    login: {
+        command: process.env.LOGIN_COMMAND || localConfig.login?.command || "/login 7717101"
+    },
+    selector: {
+        compassNameKeywords: process.env.COMPASS_KEYWORDS ? process.env.COMPASS_KEYWORDS.split(',') : (localConfig.selector?.compassNameKeywords || ["compass", "SERVER", "Selector"]),
+        targetSlot: parseInt(process.env.TARGET_SLOT || localConfig.selector?.targetSlot || 10, 10)
+    },
+    antiAfk: {
+        moveDurationMin: parseInt(process.env.AFK_MOVE_MIN || localConfig.antiAfk?.moveDurationMin || 3000, 10),
+        moveDurationMax: parseInt(process.env.AFK_MOVE_MAX || localConfig.antiAfk?.moveDurationMax || 8000, 10),
+        pauseMin: parseInt(process.env.AFK_PAUSE_MIN || localConfig.antiAfk?.pauseMin || 8000, 10),
+        pauseMax: parseInt(process.env.AFK_PAUSE_MAX || localConfig.antiAfk?.pauseMax || 20000, 10),
+        jumpChance: parseFloat(process.env.AFK_JUMP_CHANCE || localConfig.antiAfk?.jumpChance || 0.5),
+        sneakChance: parseFloat(process.env.AFK_SNEAK_CHANCE || localConfig.antiAfk?.sneakChance || 0.3),
+        sprintChance: parseFloat(process.env.AFK_SPRINT_CHANCE || localConfig.antiAfk?.sprintChance || 0.2)
+    },
+    reconnect: {
+        baseDelay: parseInt(process.env.RECONNECT_BASE || localConfig.reconnect?.baseDelay || 5000, 10),
+        maxDelay: parseInt(process.env.RECONNECT_MAX || localConfig.reconnect?.maxDelay || 30000, 10),
+        jitter: parseInt(process.env.RECONNECT_JITTER || localConfig.reconnect?.jitter || 2000, 10)
+    },
+    web: {
+        enabled: process.env.WEB_ENABLED !== 'false' && (localConfig.web?.enabled !== false),
+        port: parseInt(process.env.PORT || localConfig.web?.port || 8080, 10)
+    }
+};
+
 
 // ============================================================
 // GLOBALS
