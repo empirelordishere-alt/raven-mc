@@ -78,6 +78,16 @@ if (config.web.enabled) {
             </html>
         `);
     });
+    server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+            console.warn(`[WEB] Port ${port} already in use, trying ${port + 1}...`);
+            server.listen(port + 1, () => {
+                console.log(`[WEB] Status server running on fallback port ${port + 1}`);
+            });
+        } else {
+            console.error(`[WEB] Server error: ${err.message}`);
+        }
+    });
     server.listen(port, () => {
         console.log(`[WEB] Status server running on port ${port}`);
     });
@@ -119,7 +129,7 @@ function createBot() {
         version: config.bot.version,          // false = auto-negotiate
         checkTimeoutInterval: 60000,
         keepAlive: true,
-        client: { brand: 'vanilla' },         // mimic vanilla client
+        brand: 'vanilla',                     // mimic vanilla client
     });
 
     // -------- EVENT: CONNECTED --------
