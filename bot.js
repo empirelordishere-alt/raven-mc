@@ -1,6 +1,7 @@
 const mineflayer = require('mineflayer');
 const mc = require('minecraft-protocol');
 const http = require('http');
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const localConfig = require('./config.json');
 
 const config = {
@@ -37,6 +38,13 @@ const config = {
     web: {
         enabled: process.env.WEB_ENABLED !== 'false' && (localConfig.web?.enabled !== false),
         port: parseInt(process.env.PORT || localConfig.web?.port || 8080, 10)
+    },
+    afk: {
+        x: 228,
+        y: 118,
+        z: -258,
+        yaw: -1.7,   // degrees, from F3
+        pitch: -12.1  // degrees, from F3
     }
 };
 
@@ -50,6 +58,71 @@ let isConnecting = false;
 let reconnectAttempts = 0;
 let botStatus = 'initializing';
 let lastError = '';
+
+// ============================================================
+// SAFE REGISTRIES – prevents cross-connection leaks
+// ============================================================
+let activeTimeouts = [];
+let activeIntervals = [];
+
+function safeSetTimeout(fn, delay) {
+    const timer = setTimeout(() => {
+        activeTimeouts = activeTimeouts.filter(t => t !== timer);
+        fn();
+    }, delay);
+    activeTimeouts.push(timer);
+    return timer;
+}
+function clearAllTimeouts() {
+    activeTimeouts.forEach(clearTimeout);
+    activeTimeouts = [];
+}
+
+function safeSetInterval(fn, delay) {
+    const timer = setInterval(fn, delay);
+    activeIntervals.push(timer);
+    return timer;
+}
+function clearAllIntervals() {
+    activeIntervals.forEach(clearInterval);
+    activeIntervals = [];
+}
+
+// Helper to determine if we are in the lobby or survival
+function isCurrentlyInLobby() {
+    if (!bot) return true;
+    if (!bot.entity || !bot.entity.position) return true;
+    
+    // 1. If dimension is the_end or unknown, we are in auth/lobby
+    const dim = bot.game ? bot.game.dimension : 'unknown';
+    if (!dim || dim === 'unknown' || dim.includes('the_end')) return true;
+
+    // 2. Check scoreboard for lobby text safely
+    if (bot.scoreboards) {
+        for (const name in bot.scoreboards) {
+            const sb = bot.scoreboards[name];
+            const titleStr = sb.title ? (typeof sb.title === 'string' ? sb.title : JSON.stringify(sb.title)).toLowerCase() : '';
+            if (titleStr.includes('lobby')) return true;
+            if (sb.itemsMap) {
+                for (const key in sb.itemsMap) {
+                    const item = sb.itemsMap[key];
+                    const nameStr = item.displayName ? (typeof item.displayName === 'string' ? item.displayName : JSON.stringify(item.displayName)).toLowerCase() : '';
+                    if (nameStr.includes('lobby')) return true;
+                }
+            }
+        }
+    }
+
+    // 3. Check hotbar slot 5 (index 4) for compass selector
+    if (bot.inventory) {
+        const slot5Item = bot.inventory.slots[36 + 4]; // Hotbar is slots 36-44
+        if (slot5Item && (slot5Item.name === 'compass' || slot5Item.name === 'recovery_compass')) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 // ============================================================
 // WEB STATUS SERVER – keeps deployment alive and shows status
@@ -119,6 +192,16 @@ function createBot() {
     isConnecting = true;
     botStatus = 'connecting';
 
+    clearAllTimeouts();
+    clearAllIntervals();
+
+    let hasLoggedIn = false;
+    let hasTeleported = false;
+    let hasStartedWalking = false;
+    let spawnCount = 0;
+    let teleportTimeout = null;
+    let loginTimeout = null;
+
     console.log(`[BOT] Creating bot '${config.bot.name}' for ${config.server.host}:${config.server.port} ...`);
 
     bot = mineflayer.createBot({
@@ -126,94 +209,219 @@ function createBot() {
         port: config.server.port,
         username: config.bot.name,
         auth: config.bot.auth,
-        version: config.bot.version,          // false = auto-negotiate
+        version: config.bot.version || '1.20.4',
         checkTimeoutInterval: 60000,
         keepAlive: true,
-        brand: 'vanilla',                     // mimic vanilla client
+    });
+
+    // DIAGNOSTIC MONITOR: Logs the bot's state every 5 seconds to debug server transition
+    safeSetInterval(() => {
+        if (!bot) return;
+        const dim = bot.game ? bot.game.dimension : 'unknown';
+        const slot5 = bot.inventory ? bot.inventory.slots[36 + 4] : null;
+        const sbNames = bot.scoreboards ? Object.keys(bot.scoreboards) : [];
+        const pos = (bot.entity && bot.entity.position) ? `(${bot.entity.position.x.toFixed(1)}, ${bot.entity.position.y.toFixed(1)}, ${bot.entity.position.z.toFixed(1)})` : 'unknown';
+        console.log(`[DIAGNOSTIC] Dim: ${dim}, Pos: ${pos}, Slot 5: ${slot5 ? slot5.name : 'empty'}, Scoreboards: ${sbNames.join(', ')}`);
+        if (bot.scoreboards) {
+            for (const name in bot.scoreboards) {
+                const sb = bot.scoreboards[name];
+                console.log(`  - Scoreboard '${name}' Title: '${sb.title}'`);
+            }
+        }
+    }, 5000);
+
+    // DIMENSION / LOBBY MONITOR: Runs every 2s
+    safeSetInterval(() => {
+        if (!bot) return;
+        
+        const inLobby = isCurrentlyInLobby();
+        const dim = bot.game ? bot.game.dimension : 'unknown';
+        
+        if (!inLobby && !hasStartedWalking) {
+            console.log(`[MONITOR] Survival server confirmed (dimension: ${dim}). Starting survival routine...`);
+            hasStartedWalking = true;
+            hasTeleported = true;
+            if (teleportTimeout) clearTimeout(teleportTimeout);
+            safeSetTimeout(() => {
+                onSurvivalJoined();
+            }, 2000);
+        } else if (inLobby && hasLoggedIn && !hasTeleported) {
+            // Keep retrying compass selection if stuck in lobby
+            if (!teleportTimeout) {
+                console.log('[MONITOR] Still in lobby. Opening compass selector...');
+                useCompassSelector();
+            }
+        }
+    }, 2000);
+
+    const performLogin = () => {
+        if (hasLoggedIn) return;
+        hasLoggedIn = true;
+        bot.chat(config.login.command);
+        console.log('[BOT] Sent login command.');
+        
+        // Wait 6 seconds. If we haven't spawned in a new world (which clears this), attempt manual compass selector.
+        teleportTimeout = safeSetTimeout(() => {
+            if (!hasTeleported) {
+                console.log('[BOT] Auto-teleport did not happen. Attempting manual compass selector...');
+                useCompassSelector();
+            }
+        }, 6000);
+    };
+
+    const useCompassSelector = () => {
+        if (hasTeleported) return;
+        console.log('[BOT] Selecting hotbar slot 5 and right-clicking...');
+        bot.setQuickBarSlot(4); // Hotbar slot 5 (0-indexed = 4)
+        
+        safeSetTimeout(() => {
+            if (hasTeleported) return;
+            bot.activateItem();
+            console.log('[BOT] Right-clicked hotbar slot 5. Waiting for server selector GUI...');
+        }, 500);
+    };
+
+    // -------- EVENT: WINDOW OPEN (GUI) --------
+    bot.on('windowOpen', (window) => {
+        const targetSlot = config.selector.targetSlot; // 10
+        const item = window.slots[targetSlot];
+        console.log(`[BOT] GUI opened: ${window.title || 'Chest GUI'}. Slot ${targetSlot} contains: ${item ? `${item.name} (${item.displayName})` : 'empty'}. Waiting 1s before clicking...`);
+        safeSetTimeout(() => {
+            if (!bot || !bot.openContainer) return;
+            bot.clickWindow(targetSlot, 0, 0).then(() => {
+                console.log(`[BOT] Successfully clicked slot ${targetSlot}.`);
+                hasTeleported = true;
+            }).catch(err => {
+                console.error(`[BOT] Error clicking window: ${err.message}`);
+            });
+        }, 1000);
     });
 
     // -------- EVENT: CONNECTED --------
     bot.on('connect', () => {
         console.log('[BOT] TCP connection established.');
         botStatus = 'connected';
+        
+        if (bot._client) {
+            bot._client.on('disconnect', (packet) => {
+                console.log(`[DEBUG] Disconnect packet: ${JSON.stringify(packet)}`);
+            });
+            bot._client.on('kick_disconnect', (packet) => {
+                console.log(`[DEBUG] Kick packet: ${JSON.stringify(packet)}`);
+            });
+        }
     });
 
     // -------- EVENT: LOGIN --------
+    let loginCount = 0;
     bot.on('login', () => {
-        console.log('[BOT] Login successful.');
+        loginCount++;
+        console.log(`[BOT] Login successful (stage: ${loginCount}).`);
         botStatus = 'logged_in';
+        
+        // Manually clear scoreboards on proxy transition to prevent stale lobby scoreboards in survival
+        bot.scoreboards = {}; 
+        
+        if (loginCount === 1) {
+            bot.physicsEnabled = false;
+            console.log('[BOT] Stage 1 (Auth): Disabled physics to prevent proxy transfer crash.');
+        } else if (loginCount === 2) {
+            console.log('[BOT] Stage 2 (Lobby). Waiting for spawn event...');
+        }
     });
 
-    // -------- EVENT: SPAWN (we are fully in the world) --------
-    bot.once('spawn', () => {
-        isConnecting = false;
-        reconnectAttempts = 0;
+    // -------- EVENT: MESSAGE (chat) --------
+    bot.on('message', (jsonMsg) => {
+        const msg = jsonMsg.toString();
+        const msgLower = msg.toLowerCase().replace(/[^a-z0-9\/\s]/g, ''); // strip unicode junk for matching
+        console.log(`[CHAT] ${msg}`);
+        
+        // Trigger login if prompted by chat (check LOGIN before register — account likely exists)
+        if ((msgLower.includes('/login') || msgLower.includes('login')) && !hasLoggedIn) {
+            console.log(`[CHAT] Server requested login via chat message.`);
+            performLogin();
+        }
+        // Trigger register if prompted by chat
+        else if ((msgLower.includes('/register') || msgLower.includes('register')) && !hasLoggedIn) {
+            console.log(`[CHAT] Server requested registration. Using password from config.`);
+            const parts = config.login.command.split(' ');
+            if (parts.length >= 2) {
+                const pass = parts[1];
+                bot.chat(`/register ${pass} ${pass}`);
+                hasLoggedIn = true;
+            }
+        }
+        // Wait for successful login/register confirmation to use the compass
+        else if ((msgLower.includes('successfully') || msgLower.includes('success') || msg.includes('ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ')) && hasLoggedIn && !hasTeleported) {
+            console.log('[BOT] Login confirmed by server! Waiting 3 seconds before using compass selector...');
+            safeSetTimeout(() => {
+                if (botStatus === 'spawned' && !hasTeleported) {
+                    useCompassSelector();
+                }
+            }, 3000);
+        }
+    });
+
+    // -------- EVENT: SPAWN --------
+    bot.on('spawn', () => {
         botStatus = 'spawned';
-        console.log(`[BOT] Spawned successfully as ${config.bot.name}.`);
+        spawnCount++;
+        
+        try {
+            const dim = (bot.game && bot.game.dimension) ? bot.game.dimension : 'unknown';
+            const posX = (bot.entity && bot.entity.position) ? bot.entity.position.x.toFixed(1) : 'unknown';
+            const posY = (bot.entity && bot.entity.position) ? bot.entity.position.y.toFixed(1) : 'unknown';
+            const posZ = (bot.entity && bot.entity.position) ? bot.entity.position.z.toFixed(1) : 'unknown';
+            
+            const inLobby = isCurrentlyInLobby();
+            console.log(`[BOT] Spawn event #${spawnCount}. Dimension: ${dim}. Position: (${posX}, ${posY}, ${posZ}). Lobby: ${inLobby}`);
 
-        // 1. Send /login command after 1.5s
-        setTimeout(() => {
-            bot.chat(config.login.command);
-            console.log('[BOT] Sent login command.');
-        }, 1500);
-
-        // 2. Find and use the compass (with retries)
-        let compassAttempts = 0;
-        const findCompass = () => {
-            if (compassAttempts > 5) {
-                console.warn('[BOT] Compass not found after 5 attempts. Skipping selector.');
-                return;
-            }
-            // Look for an item whose name or displayName contains any keyword
-            const compass = bot.inventory.items().find(item =>
-                config.selector.compassNameKeywords.some(kw =>
-                    item.name.includes(kw) ||
-                    (item.displayName && item.displayName.includes(kw))
-                )
-            );
-            if (compass) {
-                console.log(`[BOT] Found compass: ${compass.displayName || compass.name}`);
-                bot.equip(compass, 'hand', (err) => {
-                    if (err) {
-                        console.error(`[BOT] Failed to equip compass: ${err}`);
-                        return;
-                    }
-                    // Right-click to open the Server Selector GUI
-                    bot.activateItem();
-                    console.log('[BOT] Activated compass (Server Selector opened).');
-
-                    // Wait for GUI to open, then click slot 11 (index 10)
-                    setTimeout(() => {
-                        const window = bot.openContainer;
-                        if (window) {
-                            const slot = config.selector.targetSlot; // 10
-                            bot.clickWindow(slot, 0, 0);
-                            console.log(`[BOT] Clicked slot ${slot} (Survival/Diamond Pickaxe). Teleporting...`);
-                        } else {
-                            console.warn('[BOT] No container window opened after using compass.');
-                        }
-                    }, 1500);
-                });
+            // Check if we are in Survival
+            if (!inLobby) {
+                if (!hasTeleported) {
+                    console.log('[BOT] Transitioned to Survival!');
+                    hasTeleported = true;
+                }
+                bot.physicsEnabled = true;
+                if (teleportTimeout) clearTimeout(teleportTimeout);
+                
+                safeSetTimeout(() => {
+                    onSurvivalJoined();
+                }, 2000);
             } else {
-                compassAttempts++;
-                console.log(`[BOT] Compass not yet found (attempt ${compassAttempts}), retrying in 2s...`);
-                setTimeout(findCompass, 2000);
+                // We are in Lobby/Auth
+                if (spawnCount === 1) {
+                    // AUTO-LOGIN: Send login command 3s after first spawn
+                    loginTimeout = safeSetTimeout(() => {
+                        if (!hasLoggedIn) {
+                            console.log('[BOT] Auto-sending login command...');
+                            performLogin();
+                        }
+                    }, 3000);
+                } else if (hasLoggedIn && !hasTeleported) {
+                    // If we are logged in but still in lobby, trigger the server selector
+                    console.log('[BOT] Triggered server selector in lobby...');
+                    safeSetTimeout(() => {
+                        if (!hasTeleported) {
+                            useCompassSelector();
+                        }
+                    }, 3000);
+                }
             }
-        };
-        // Start searching after 4 seconds (enough time for login to complete)
-        setTimeout(findCompass, 4000);
+        } catch (err) {
+            console.error(`[ERROR] Error in spawn handler: ${err.message}`);
+        }
+    });
 
-        // 3. Send /afk after teleport (8s total from spawn)
-        setTimeout(() => {
-            bot.chat('/afk');
-            console.log('[BOT] Sent /afk. Starting anti-AFK in 10s.');
-        }, 8000);
-
-        // 4. Start anti-AFK movements after 18s (8s + 10s wait)
-        setTimeout(() => {
-            console.log('[BOT] Starting anti-AFK movements.');
-            startAntiAfk();
-        }, 18000);
+    // -------- EVENT: RESPAWN --------
+    bot.on('respawn', () => {
+        const inLobby = isCurrentlyInLobby();
+        console.log(`[BOT] Respawned. Lobby: ${inLobby}`);
+        if (!inLobby) {
+            safeSetTimeout(() => {
+                onSurvivalJoined();
+            }, 2000);
+        }
     });
 
     // -------- EVENT: KICKED --------
@@ -221,6 +429,9 @@ function createBot() {
         console.log(`[BOT] Kicked from server. Reason: ${reason}`);
         botStatus = 'kicked';
         lastError = reason;
+        isConnecting = false;
+        if (teleportTimeout) clearTimeout(teleportTimeout);
+        if (loginTimeout) clearTimeout(loginTimeout);
         scheduleReconnect('kick');
     });
 
@@ -229,6 +440,9 @@ function createBot() {
         console.log(`[BOT] Connection ended. Reason: ${reason || 'unknown'}`);
         botStatus = 'disconnected';
         lastError = reason || 'socketClosed';
+        isConnecting = false;
+        if (teleportTimeout) clearTimeout(teleportTimeout);
+        if (loginTimeout) clearTimeout(loginTimeout);
         scheduleReconnect('end');
     });
 
@@ -236,8 +450,11 @@ function createBot() {
     bot.on('error', (err) => {
         console.error(`[BOT] Internal error: ${err.message}`);
         lastError = err.message;
+        isConnecting = false;
         // Reconnect only for network-level errors
         if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT' || err.message.includes('socket')) {
+            if (teleportTimeout) clearTimeout(teleportTimeout);
+            if (loginTimeout) clearTimeout(loginTimeout);
             scheduleReconnect('error');
         }
     });
@@ -278,79 +495,75 @@ function scheduleReconnect(source) {
 }
 
 // ============================================================
-// ANTI-AFK – human-like random movements to avoid being kicked
+// SURVIVAL ROUTINE – Send /afk, wait 15s, type "im afk", run around
 // ============================================================
-let afkInterval = null;
+let survivalRoutineStarted = false;
 
-function startAntiAfk() {
-    if (afkInterval) clearInterval(afkInterval);
+function onSurvivalJoined() {
+    if (survivalRoutineStarted) return;
+    survivalRoutineStarted = true;
 
-    const performRandomMove = () => {
-        if (!bot || !bot.entity) {
-            console.warn('[ANTI-AFK] Bot not available, stopping movements.');
-            return;
+    console.log('[SURVIVAL] Step 1: Joined survival world! Waiting 3 seconds before sending /afk...');
+    safeSetTimeout(() => {
+        if (!bot || !bot.chat) return;
+        try {
+            console.log('[SURVIVAL] Step 1b: Sending /afk command...');
+            bot.chat('/afk');
+        } catch (err) {
+            console.error(`[SURVIVAL] Failed to send /afk: ${err.message}`);
         }
 
-        const actions = ['forward', 'back', 'left', 'right'];
-        const action = actions[Math.floor(Math.random() * actions.length)];
-        const duration = config.antiAfk.moveDurationMin +
-            Math.random() * (config.antiAfk.moveDurationMax - config.antiAfk.moveDurationMin);
+        console.log('[SURVIVAL] Step 2: Waiting 15 seconds after /afk...');
+        safeSetTimeout(() => {
+            if (!bot || !bot.chat) return;
+            try {
+                console.log('[SURVIVAL] Step 3: 15s passed! Typing "im afk" in chat...');
+                bot.chat('im afk');
+            } catch (err) {
+                console.error(`[SURVIVAL] Failed to send im afk: ${err.message}`);
+            }
 
-        // Start moving
-        bot.setControlState(action, true);
-        console.log(`[ANTI-AFK] Moving ${action} for ${(duration/1000).toFixed(1)}s`);
+            console.log('[SURVIVAL] Step 4: Starting random running movement routine...');
+            startRandomRunning();
+        }, 15000);
+    }, 3000);
+}
 
-        // Random jump during movement
-        if (Math.random() < config.antiAfk.jumpChance) {
-            setTimeout(() => {
-                bot.setControlState('jump', true);
-                setTimeout(() => bot.setControlState('jump', false), 300 + Math.random() * 500);
-            }, 500 + Math.random() * 800);
-        }
+let runningInterval = null;
 
-        // Randomly change look direction
-        const yaw = Math.random() * Math.PI * 2 - Math.PI;
-        const pitch = (Math.random() * Math.PI / 1.5) - Math.PI / 3;
-        bot.look(yaw, pitch, true);
+function startRandomRunning() {
+    if (runningInterval) clearInterval(runningInterval);
 
-        // Random sneak
-        if (Math.random() < config.antiAfk.sneakChance) {
-            bot.setControlState('sneak', true);
-            setTimeout(() => bot.setControlState('sneak', false), 1000 + Math.random() * 1500);
-        }
+    const actions = ['forward', 'back', 'left', 'right'];
 
-        // Random sprint
-        if (Math.random() < config.antiAfk.sprintChance) {
-            bot.setControlState('sprint', true);
-            setTimeout(() => bot.setControlState('sprint', false), 1500 + Math.random() * 2000);
-        }
+    const doRandomMove = () => {
+        if (!bot || !bot.entity) return;
 
-        // Stop movement after duration
-        setTimeout(() => {
-            bot.setControlState(action, false);
-            // Clean up any leftover controls
-            setTimeout(() => {
-                bot.setControlState('jump', false);
-                bot.setControlState('sneak', false);
-                bot.setControlState('sprint', false);
-            }, 300);
-        }, duration);
+        // Reset control states
+        actions.forEach(action => bot.setControlState(action, false));
+        bot.setControlState('jump', false);
+        bot.setControlState('sprint', false);
+        bot.setControlState('sneak', false);
+
+        // Pick direction
+        const chosenDir = actions[Math.floor(Math.random() * actions.length)];
+        bot.setControlState(chosenDir, true);
+
+        // Randomly sprint, jump, or sneak
+        if (Math.random() < 0.75) bot.setControlState('sprint', true);
+        if (Math.random() < 0.45) bot.setControlState('jump', true);
+        if (Math.random() < 0.15) bot.setControlState('sneak', true);
+
+        // Turn head randomly
+        const yaw = (Math.random() * 360 - 180) * (Math.PI / 180);
+        const pitch = (Math.random() * 40 - 20) * (Math.PI / 180);
+        bot.look(yaw, pitch, false);
+
+        console.log(`[RUNNING] Active action: ${chosenDir}, sprint: ${bot.controlState.sprint}, jump: ${bot.controlState.jump}`);
     };
 
-    // Recursive loop with random pause between moves
-    const loop = () => {
-        if (!bot || !bot.entity) {
-            console.warn('[ANTI-AFK] Bot ended, stopping loop.');
-            return;
-        }
-        performRandomMove();
-        const nextDelay = config.antiAfk.pauseMin +
-            Math.random() * (config.antiAfk.pauseMax - config.antiAfk.pauseMin);
-        setTimeout(loop, nextDelay);
-    };
-
-    // Start after a short delay
-    setTimeout(loop, 2000);
+    doRandomMove();
+    runningInterval = safeSetInterval(doRandomMove, 2000 + Math.floor(Math.random() * 2000));
 }
 
 // ============================================================

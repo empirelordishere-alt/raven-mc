@@ -4,15 +4,15 @@
     "port": 25565
   },
   "bot": {
-    "name": "atomic",
+    "name": "MoonCrow123",
     "auth": "offline",
     "version": false
   },
   "login": {
-    "command": "/login 7717101"
+    "command": "/login qazqazqaz"
   },
   "selector": {
-    "compassNameKeywords": ["compass", "SERVER", "Selector"],
+    "compassNameKeywords": ["SERVER SELECTOR", "Selector", "Server Selector"],
     "targetSlot": 10
   },
   "antiAfk": {
@@ -25,9 +25,9 @@
     "sprintChance": 0.2
   },
   "reconnect": {
-    "baseDelay": 5000,
-    "maxDelay": 30000,
-    "jitter": 2000
+    "baseDelay": 15000,
+    "maxDelay": 60000,
+    "jitter": 5000
   },
   "web": {
     "enabled": true,
