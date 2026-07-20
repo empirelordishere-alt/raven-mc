@@ -1,3 +1,4 @@
+cat > config.json << 'EOF'
 {
   "server": {
     "host": "raven-mc.net",
@@ -34,3 +35,4 @@
     "port": 8080
   }
 }
+EOF
